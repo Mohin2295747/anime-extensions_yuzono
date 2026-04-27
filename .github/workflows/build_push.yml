@@ -62,51 +62,59 @@ jobs:
         run: rm signingkey.jks
 
   create_release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 15
-    steps:
-      - name: Download all APKs
-        uses: actions/download-artifact@v4
-        with:
-          name: all-apks
-          path: ./apks
+  name: Create Release
+  needs: build
+  runs-on: ubuntu-latest
+  permissions:
+    contents: write
+  timeout-minutes: 15
+  steps:
+    - name: Checkout (for git tags)
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 0
 
-      - name: Create ZIP of all APKs
-        run: |
-          zip -j all-extensions.zip ./apks/*.apk
-          echo "ZIP created with $(ls ./apks/*.apk | wc -l) APKs"
+    - name: Download all APKs
+      uses: actions/download-artifact@v4
+      with:
+        name: all-apks
+        path: ./apks
 
-      - name: Compute next version tag
-        id: version
-        run: |
-          git fetch --tags
-          latest_tag=$(git tag -l "v*.*.*.*" | sort -V | tail -n1)
-          if [ -z "$latest_tag" ]; then
-            next_version="v0.0.0.1"
-          else
-            IFS='.' read -ra parts <<< "${latest_tag#v}"
-            parts[3]=$((parts[3] + 1))
-            next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
-          fi
-          echo "tag=$next_version" >> $GITHUB_OUTPUT
+    - name: Create ZIP of all APKs
+      run: |
+        # Find all APK files recursively and zip them (strip directories)
+        find ./apks -name "*.apk" -type f -exec zip -j all-extensions.zip {} +
+        echo "ZIP created with $(zipinfo -h all-extensions.zip | grep -c '^.……') APKs"
 
-      - name: Generate release notes
-        run: |
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
-          ls -1 ./apks/*.apk | xargs -n1 basename >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+    - name: Compute next version tag
+      id: version
+      run: |
+        git fetch --tags
+        latest_tag=$(git tag -l "v*.*.*.*" | sort -V | tail -n1)
+        if [ -z "$latest_tag" ]; then
+          next_version="v0.0.0.1"
+        else
+          IFS='.' read -ra parts <<< "${latest_tag#v}"
+          parts[3]=$((parts[3] + 1))
+          next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
+        fi
+        echo "tag=$next_version" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --title "Extensions" \
-            --notes "${{ env.RELEASE_NOTES }}" \
-            --latest \
-            --repo ${{ github.repository }} \
-            ./apks/*.apk all-extensions.zip
+    - name: Generate release notes
+      run: |
+        echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+        find ./apks -name "*.apk" -type f -exec basename {} \; | sort >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ secrets.BOT_PAT }}
+      run: |
+        # Collect all APK files and the zip
+        apk_files=$(find ./apks -name "*.apk" -type f)
+        gh release create "${{ steps.version.outputs.tag }}" \
+          --title "Extensions" \
+          --notes "${{ env.RELEASE_NOTES }}" \
+          --latest \
+          --repo ${{ github.repository }} \
+          $apk_files all-extensions.zip
