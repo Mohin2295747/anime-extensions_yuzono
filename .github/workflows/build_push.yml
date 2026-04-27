@@ -10,7 +10,6 @@ on:
       - '!.github/**'
       - '.github/scripts/**'
       - '.github/workflows/build_push.yml'
-  # Manual trigger
   workflow_dispatch:
 
 permissions: {}
@@ -21,83 +20,63 @@ concurrency:
 
 env:
   CI_CHUNK_SIZE: 15
+  IS_PR_CHECK: false
 
 jobs:
   prepare:
+    permissions:
+      contents: write
     name: Prepare job
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      latestCommitMessage: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
       matrix: ${{ steps.generate-matrices.outputs.matrix }}
+
     steps:
       - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - id: generate-matrices
-        name: Create output matrices
+      - name: Set env
+        id: set-env
         run: |
-          # Find all module directories
-          modules=()
-          for dir in src/*/*; do
-            if [ -d "$dir" ] && [ -f "$dir/build.gradle" ]; then
-              module_name="${dir#src/}"
-              modules+=("$module_name")
-            fi
-          done
-          
-          echo "Found ${#modules[@]} modules"
-          
-          # Create chunks
-          chunk_size=15
-          chunks=()
-          for ((i=0; i<${#modules[@]}; i+=chunk_size)); do
-            chunk_modules=("${modules[@]:i:chunk_size}")
-            # Convert array to JSON
-            modules_json=$(printf '"%s",' "${chunk_modules[@]}" | sed 's/,$//')
-            chunks+=("{\"number\": $((i/chunk_size + 1)), \"modules\": [$modules_json]}")
-          done
-          
-          # Create final matrix
-          if [ ${#chunks[@]} -eq 0 ]; then
-            matrix="{\"chunk\": []}"
-          else
-            chunks_json=$(printf '%s,' "${chunks[@]}" | sed 's/,$//')
-            matrix="{\"chunk\": [$chunks_json]}"
-          fi
-          
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
-          echo "Generated matrix: $matrix"
+          echo "LATEST_COMMIT_MESSAGE<<EOF" >> $GITHUB_OUTPUT
+          git log -1 --pretty=%B >> $GITHUB_OUTPUT
+          echo "Built on commit: $(git log -1 --pretty=%H)" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate full matrix (always build)
+        id: generate-matrices
+        run: |
+          python ./.github/scripts/generate-build-matrices.py "" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
     steps:
       - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.ref_name }}
-          persist-credentials: false
+        uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
-        with:
-          cache-read-only: ${{ matrix.chunk.number > 1 }}
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Prepare signing key
         run: |
-          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
+          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
           chmod 600 signingkey.jks
 
       - name: Build extensions (${{ matrix.chunk.number }})
@@ -109,93 +88,48 @@ jobs:
         run: |
           ./gradlew $MODULES
 
-      - name: Upload APKs to temporary release
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          # Find all APK files in this chunk
-          apk_files=$(find . -name "*.apk" -type f)
-          
-          if [ -n "$apk_files" ]; then
-            # Check if temp release exists
-            if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
-              # Upload to existing release
-              echo "$apk_files" | while read -r apk; do
-                gh release upload "temp-build" "$apk" --clobber --repo ${{ github.repository }}
-                echo "Uploaded: $(basename "$apk")"
-              done
-            else
-              # Create release with first APK
-              first_apk=$(echo "$apk_files" | head -1)
-              gh release create "temp-build" --title "Temporary Build" --notes "Building..." "$first_apk" --repo ${{ github.repository }}
-              echo "Created temp release and uploaded: $(basename "$first_apk")"
-              
-              # Upload remaining APKs
-              echo "$apk_files" | tail -n +2 | while read -r apk; do
-                gh release upload "temp-build" "$apk" --repo ${{ github.repository }}
-                echo "Uploaded: $(basename "$apk")"
-              done
-            fi
-          fi
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks-${{ matrix.chunk.number }}
+          path: "**/*.apk"
 
       - name: Clean up CI files
-        run: rm signingkey.jks
+        run: rm -f signingkey.jks
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
     permissions:
       contents: write
-    timeout-minutes: 15
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Wait for uploads to complete
-        run: sleep 30
-
-      - name: Check if temp release exists
-        id: check_release
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
-            echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
-          else
-            echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
-            echo "No temporary release found"
-            exit 1
-          fi
-
-      - name: Get APK count from temp release
-        id: count
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
-          apk_count=$(gh api "/repos/${{ github.repository }}/releases/$release_id/assets" --jq '[.[] | select(.name | endswith(".apk"))] | length')
-          
-          echo "APK_COUNT=$apk_count" >> $GITHUB_ENV
-          echo "Found $apk_count APK files in temp release"
+      - name: Download all APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Compute next version tag
         id: version
         run: |
           git fetch --tags
-          
-          # Find existing version tags
+
           version_tags=$(git tag -l "v*.*.*.*" | sort -V)
-          
+
           if [ -z "$version_tags" ]; then
             next_version="v0.0.0.1"
           else
             latest_tag=$(echo "$version_tags" | tail -n1)
             IFS='.' read -ra parts <<< "${latest_tag#v}"
-            
-            # Increment last part with carry-over (base 10)
+
             pos=3
             while [ $pos -ge 0 ]; do
               parts[$pos]=$((parts[$pos] + 1))
@@ -205,46 +139,22 @@ jobs:
               parts[$pos]=0
               pos=$((pos - 1))
             done
-            
+
             next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
           fi
-          
-          echo "Next version: $next_version"
+
           echo "tag=$next_version" >> $GITHUB_OUTPUT
 
-      - name: Get APK filenames for release notes
-        id: notes
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+      - name: Generate release notes
         run: |
-          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
-          
-          # Get list of APK filenames
-          apk_names=$(gh api "/repos/${{ github.repository }}/releases/$release_id/assets" --jq '[.[] | select(.name | endswith(".apk")) | .name] | sort | .[]')
-          
-          # Create release notes with one filename per line
-          notes=""
-          while IFS= read -r name; do
-            notes="${notes}${name}\n"
-          done <<< "$apk_names"
-          
-          # Save to environment variable
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
-          echo -e "$notes" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          
-          echo "Release notes generated with $(echo "$apk_names" | wc -l) APK files"
+          find artifacts -name "*.apk" -type f | sed 's|.*/||' | sort > notes.txt
 
-      - name: Rename temp release to versioned release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          gh release edit "temp-build" \
-            --tag "${{ steps.version.outputs.tag }}" \
+          gh release create "${{ steps.version.outputs.tag }}" \
+            artifacts/**/*.apk \
             --title "Extensions" \
-            --notes "${{ env.RELEASE_NOTES }}" \
-            --latest \
-            --repo ${{ github.repository }}
-          
-          echo "✅ Release successfully created as ${{ steps.version.outputs.tag }}"
-          echo "📦 Total APKs: $(gh release view "${{ steps.version.outputs.tag }}" --repo ${{ github.repository }} --json assets -q '.assets | length')"
+            --notes-file notes.txt \
+            --latest
