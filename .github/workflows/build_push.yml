@@ -129,14 +129,22 @@ jobs:
           apk_files=$(find . -name "*.apk" -type f)
           
           if [ -n "$apk_files" ]; then
-            # Create or update temporary release
-            echo "$apk_files" | while read -r apk; do
-              if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
+            # Check if temp release exists
+            if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
+              # Upload to existing release
+              echo "$apk_files" | while read -r apk; do
                 gh release upload "temp-build" "$apk" --clobber --repo ${{ github.repository }}
-              else
-                gh release create "temp-build" --title "Temporary Build" --notes "Building..." "$apk" --repo ${{ github.repository }}
-              fi
-            done
+              done
+            else
+              # Create release with first APK
+              first_apk=$(echo "$apk_files" | head -1)
+              gh release create "temp-build" --title "Temporary Build" --notes "Building..." "$first_apk" --repo ${{ github.repository }}
+              
+              # Upload remaining APKs
+              echo "$apk_files" | tail -n +2 | while read -r apk; do
+                gh release upload "temp-build" "$apk" --repo ${{ github.repository }}
+              done
+            fi
           fi
 
       - name: Clean up CI files
@@ -156,17 +164,28 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check if temp release exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
+            echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Skip if no temp release
+        if: env.RELEASE_EXISTS == 'false'
+        run: |
+          echo "No temporary release found. Skipping release creation."
+          exit 0
+
       - name: Count APK files in temp release
         id: count
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          # Check if temp release exists
-          if ! gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
-            echo "APK_COUNT=0" >> $GITHUB_ENV
-            exit 0
-          fi
-          
           # Get the release ID for "temp-build"
           release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
           
@@ -193,8 +212,6 @@ jobs:
 
       - name: Compute next version tag
         id: version
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           # Fetch all tags
           git fetch --tags
@@ -242,32 +259,21 @@ jobs:
             notes="${notes}${name}\n"
           done <<< "$apk_names"
           
-          # Save to file to avoid escaping issues
-          echo -e "$notes" > release_notes.txt
-          
-          echo "Release notes generated with $(echo "$apk_names" | wc -l) APK files"
+          # Save to environment variable
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo -e "$notes" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-      - name: Convert temp release to versioned release
+      - name: Rename temp release to versioned release
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          # Get the release ID
-          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
-          
-          # Delete the temporary release (this preserves the assets)
-          gh release delete "temp-build" --yes --repo ${{ github.repository }} --cleanup-tag
-          
-          # Create new release with proper version
-          gh release create "${{ steps.version.outputs.tag }}" \
+          # Update the release tag, title, and notes (preserves all assets)
+          gh release edit "temp-build" \
+            --tag "${{ steps.version.outputs.tag }}" \
             --title "Extensions" \
-            --notes "$(cat release_notes.txt)" \
+            --notes "${{ env.RELEASE_NOTES }}" \
             --latest \
             --repo ${{ github.repository }}
           
-          # Note: The assets were preserved after deletion? Actually we need to re-upload
-          # Better approach: download assets then re-upload
-          
-          echo "Release created with tag ${{ steps.version.outputs.tag }}"
-
-      - name: Cleanup
-        run: rm -f release_notes.txt
+          echo "Release renamed to ${{ steps.version.outputs.tag }} with $(gh release view "${{ steps.version.outputs.tag }}" --repo ${{ github.repository }} --json assets -q '.assets | length') APK files"
