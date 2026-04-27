@@ -35,23 +35,46 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          main-branch-name: ${{ github.ref_name }}
-          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
-
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+          # Find all module directories
+          modules=()
+          for dir in src/*/*; do
+            if [ -d "$dir" ] && [ -f "$dir/build.gradle" ]; then
+              module_name="${dir#src/}"
+              modules+=("$module_name")
+            fi
+          done
+          
+          echo "Found ${#modules[@]} modules"
+          
+          # Create chunks
+          chunk_size=15
+          chunks=()
+          for ((i=0; i<${#modules[@]}; i+=chunk_size)); do
+            chunk_modules=("${modules[@]:i:chunk_size}")
+            # Convert array to JSON
+            modules_json=$(printf '"%s",' "${chunk_modules[@]}" | sed 's/,$//')
+            chunks+=("{\"number\": $((i/chunk_size + 1)), \"modules\": [$modules_json]}")
+          done
+          
+          # Create final matrix
+          if [ ${#chunks[@]} -eq 0 ]; then
+            matrix="{\"chunk\": []}"
+          else
+            chunks_json=$(printf '%s,' "${chunks[@]}" | sed 's/,$//')
+            matrix="{\"chunk\": [$chunks_json]}"
+          fi
+          
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          echo "Generated matrix: $matrix"
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
