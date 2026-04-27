@@ -9,7 +9,6 @@ on:
       - '!.md'
       - '!.github/'
       - '.github/scripts/'
-      - '.github/workflows/build_push.yml'
   workflow_dispatch:
 
 permissions: {}
@@ -18,80 +17,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CI_CHUNK_SIZE: 15
-  IS_PR_CHECK: false
-
 jobs:
-  prepare:
-    permissions:
-      contents: write
-    name: Prepare job
+  build:
+    name: Build all extensions
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      latestCommitMessage: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
-      matrix: ${{ steps.generate-matrices.outputs.matrix }}
-      delete: ${{ steps.generate-matrices.outputs.delete }}
+    timeout-minutes: 30
     steps:
-      - name: Checkout ${{ github.ref_name }} branch
+      - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-
-      - name: Set env
-        id: set-env
-        run: |
-          echo "LATEST_COMMIT_MESSAGE<<{delimiter}
-          $(git log -1 --pretty=%B)
-          Built on commit: $(git log -1 --pretty=%H)
-          {delimiter}" >> $GITHUB_OUTPUT
-
-      - name: Find lib changes
-        id: modified-libs
-        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
-        with:
-          files: lib/
-          files_ignore: lib/**.md
-          files_separator: " "
-          safe_output: false
-
-      - name: Bump extensions that use a modified lib
-        if: steps.modified-libs.outputs.any_changed == 'true' && github.repository == 'yuzono/anime-extensions'
-        env:
-          COMMIT_MESSAGE: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
-        run: |
-          latest_commit_author=$(git log -1 --pretty=%an)
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          chmod +x ./.github/scripts/bump-versions.py
-          ./.github/scripts/bump-versions.py "$COMMIT_MESSAGE" ${{ steps.modified-libs.outputs.all_changed_files }}
-          git push
-
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          main-branch-name: ${{ github.ref_name }}
-          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
-
-      - id: generate-matrices
-        name: Create output matrices
-        run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
-
-  build:
-    name: Build extensions (${{ matrix.chunk.number }})
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.ref_name }}
-          persist-credentials: false
 
       - name: Set up Java
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
@@ -101,103 +36,71 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
-        with:
-          cache-read-only: ${{ matrix.chunk.number > 1 }}
 
       - name: Prepare signing key
         run: |
           echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
           chmod 600 signingkey.jks
 
-      - name: Build extensions (${{ matrix.chunk.number }})
+      - name: Build all extensions
         env:
-          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
           ALIAS: ${{ secrets.ALIAS }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew $MODULES
+          # Build all APKs (adjust the gradle task if needed)
+          ./gradlew assembleRelease
 
       - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: apks-chunk-${{ matrix.chunk.number }}
+          name: all-apks
           path: '**/*.apk'
-          if-no-files-found: ignore
+          if-no-files-found: error
 
-      - name: Clean up CI files
+      - name: Clean up
         run: rm signingkey.jks
 
   create_release:
     name: Create Release
     needs: build
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'yuzono/anime-extensions'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-
-      - name: Download all APK artifacts
+      - name: Download all APKs
         uses: actions/download-artifact@v4
         with:
-          pattern: apks-chunk-*
-          merge-multiple: true
+          name: all-apks
           path: ./apks
 
-      - name: Create ZIP file with all APKs
+      - name: Create ZIP of all APKs
         run: |
           zip -j all-extensions.zip ./apks/*.apk
-          echo "ZIP file created: all-extensions.zip"
-
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: all-extensions-zip
-          path: all-extensions.zip
-          if-no-files-found: error
+          echo "ZIP created with $(ls ./apks/*.apk | wc -l) APKs"
 
       - name: Compute next version tag
         id: version
         run: |
           git fetch --tags
-          version_tags=$(git tag -l "v*.*.*.*" | sort -V)
-          if [ -z "$version_tags" ]; then
+          latest_tag=$(git tag -l "v*.*.*.*" | sort -V | tail -n1)
+          if [ -z "$latest_tag" ]; then
             next_version="v0.0.0.1"
           else
-            latest_tag=$(echo "$version_tags" | tail -n1)
             IFS='.' read -ra parts <<< "${latest_tag#v}"
-            pos=3
-            while [ $pos -ge 0 ]; do
-              parts[$pos]=$((parts[$pos] + 1))
-              if [ ${parts[$pos]} -lt 10 ]; then
-                break
-              fi
-              parts[$pos]=0
-              pos=$((pos - 1))
-            done
+            parts[3]=$((parts[3] + 1))
             next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
           fi
-          echo "Next version: $next_version"
           echo "tag=$next_version" >> $GITHUB_OUTPUT
 
       - name: Generate release notes
-        id: notes
         run: |
-          apk_names=$(find ./apks -name "*.apk" -type f -exec basename {} \; | sort)
-          notes=""
-          while IFS= read -r name; do
-            notes="${notes}${name}\n"
-          done <<< "$apk_names"
           echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
-          echo -e "$notes" >> $GITHUB_ENV
+          ls -1 ./apks/*.apk | xargs -n1 basename >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: Create versioned release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
@@ -206,4 +109,4 @@ jobs:
             --notes "${{ env.RELEASE_NOTES }}" \
             --latest \
             --repo ${{ github.repository }} \
-            ./apks/*.apk
+            ./apks/*.apk all-extensions.zip
