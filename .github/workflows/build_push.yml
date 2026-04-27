@@ -134,15 +134,18 @@ jobs:
               # Upload to existing release
               echo "$apk_files" | while read -r apk; do
                 gh release upload "temp-build" "$apk" --clobber --repo ${{ github.repository }}
+                echo "Uploaded: $(basename "$apk")"
               done
             else
               # Create release with first APK
               first_apk=$(echo "$apk_files" | head -1)
               gh release create "temp-build" --title "Temporary Build" --notes "Building..." "$first_apk" --repo ${{ github.repository }}
+              echo "Created temp release and uploaded: $(basename "$first_apk")"
               
               # Upload remaining APKs
               echo "$apk_files" | tail -n +2 | while read -r apk; do
                 gh release upload "temp-build" "$apk" --repo ${{ github.repository }}
+                echo "Uploaded: $(basename "$apk")"
               done
             fi
           fi
@@ -164,6 +167,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Wait for all uploads to complete
+        run: sleep 30
+
       - name: Check if temp release exists
         id: check_release
         env:
@@ -181,7 +187,7 @@ jobs:
           echo "No temporary release found. Skipping release creation."
           exit 0
 
-      - name: Count APK files in temp release
+      - name: Get APK count from temp release
         id: count
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
@@ -195,16 +201,7 @@ jobs:
           echo "APK_COUNT=$apk_count" >> $GITHUB_ENV
           echo "Found $apk_count APK files in temp release"
 
-      - name: Delete temp release if APK count > 10
-        if: env.APK_COUNT > 10
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          echo "APK count (${{ env.APK_COUNT }}) exceeds limit (10). Deleting temporary release."
-          gh release delete "temp-build" --yes --repo ${{ github.repository }}
-          exit 0
-
-      - name: Skip release if no APKs found
+      - name: Skip if no APKs found
         if: env.APK_COUNT == 0
         run: |
           echo "No APK files found. Skipping release creation."
@@ -263,6 +260,8 @@ jobs:
           echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
           echo -e "$notes" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+          
+          echo "Release notes generated with $(echo "$apk_names" | wc -l) APK files"
 
       - name: Rename temp release to versioned release
         env:
@@ -276,4 +275,5 @@ jobs:
             --latest \
             --repo ${{ github.repository }}
           
-          echo "Release renamed to ${{ steps.version.outputs.tag }} with $(gh release view "${{ steps.version.outputs.tag }}" --repo ${{ github.repository }} --json assets -q '.assets | length') APK files"
+          echo "✅ Release successfully created as ${{ steps.version.outputs.tag }}"
+          echo "📦 Total APKs: $(gh release view "${{ steps.version.outputs.tag }}" --repo ${{ github.repository }} --json assets -q '.assets | length')"
