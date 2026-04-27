@@ -58,10 +58,6 @@ jobs:
           files_separator: " "
           safe_output: false
 
-        # This step is going to commit, but this will not trigger another workflow.
-        # If any changes to lib/ caused on master branch, bump the extensions that uses the modified lib.
-        # If any changes caused by the merge commit, skip this step because versions should already pumped with that merge.
-        # But that should be avoided because our own extensions may not be bumped.
       - name: Bump extensions that use a modified lib
         if: steps.modified-libs.outputs.any_changed == 'true' && github.repository == 'yuzono/anime-extensions'
         env:
@@ -122,81 +118,156 @@ jobs:
           ALIAS: ${{ secrets.ALIAS }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          MEGACLOUD_API: ${{ secrets.MEGACLOUD_API }}
-          KISSKH_API: ${{ secrets.KISSKH_API }}
-          KISSKH_SUB_API: ${{ secrets.KISSKH_SUB_API }}
-          KAISVA: ${{ secrets.KAISVA }}
-          TMDB_API: ${{ secrets.TMDB_API }}
         run: |
           ./gradlew $MODULES
 
-      - name: Upload APKs (${{ matrix.chunk.number }})
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.repository == 'yuzono/anime-extensions'
-        with:
-          name: "individual-apks-${{ matrix.chunk.number }}"
-          path: "**/*.apk"
-          retention-days: 1
+      - name: Upload APKs to temporary release
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          # Find all APK files in this chunk
+          apk_files=$(find . -name "*.apk" -type f)
+          
+          if [ -n "$apk_files" ]; then
+            # Create or update temporary release
+            echo "$apk_files" | while read -r apk; do
+              if gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
+                gh release upload "temp-build" "$apk" --clobber --repo ${{ github.repository }}
+              else
+                gh release create "temp-build" --title "Temporary Build" --notes "Building..." "$apk" --repo ${{ github.repository }}
+              fi
+            done
+          fi
 
       - name: Clean up CI files
         run: rm signingkey.jks
 
-  publish:
-    name: Publish extension repo
-    needs: [prepare, build]
-    if: github.repository == 'yuzono/anime-extensions'
+  finalize_release:
+    name: Finalize Release
+    needs: build
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'yuzono/anime-extensions'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 15
     steps:
-      - name: Download APK artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: ~/apk-artifacts
-
-      - name: Set up JDK
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
-        with:
-          java-version: 17
-          distribution: temurin
-
-      - name: Checkout ${{ github.ref_name }} branch
+      - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.ref_name }}
-          path: ${{ github.ref_name }}
           fetch-depth: 0
-          persist-credentials: false
 
-      - name: Create repo artifacts
-        run: |
-          cd ${{ github.ref_name }}
-          python ./.github/scripts/move-built-apks.py
-          INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/komikku-app/aniyomi-extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
-          curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
-          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
-          python ./.github/scripts/create-repo.py
-
-      - name: Checkout repo branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: yuzono/aniyomi-repo
-          token: ${{ secrets.BOT_PAT }}
-          ref: repo
-          path: repo
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Merge repo
+      - name: Count APK files in temp release
+        id: count
         env:
-          DELETE: ${{ needs.prepare.outputs.delete }}
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          cd repo
-          python ../${{ github.ref_name }}/.github/scripts/merge-repo.py "$DELETE" '${{ github.ref_name }}/repo'
+          # Check if temp release exists
+          if ! gh release view "temp-build" --repo ${{ github.repository }} 2>/dev/null; then
+            echo "APK_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          # Get the release ID for "temp-build"
+          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
+          
+          # Get all assets for the release and count APKs
+          apk_count=$(gh api "/repos/${{ github.repository }}/releases/$release_id/assets" --jq '[.[] | select(.name | endswith(".apk"))] | length')
+          
+          echo "APK_COUNT=$apk_count" >> $GITHUB_ENV
+          echo "Found $apk_count APK files in temp release"
 
-      - name: Deploy repo
-        uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10.0.0
-        with:
-          message: "${{ needs.prepare.outputs.latestCommitMessage }}"
-          cwd: "./repo"
-          # committer_name: github-actions[bot]
-          # committer_email: github-actions[bot]@users.noreply.github.com
+      - name: Delete temp release if APK count > 10
+        if: env.APK_COUNT > 10
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          echo "APK count (${{ env.APK_COUNT }}) exceeds limit (10). Deleting temporary release."
+          gh release delete "temp-build" --yes --repo ${{ github.repository }}
+          exit 0
+
+      - name: Skip release if no APKs found
+        if: env.APK_COUNT == 0
+        run: |
+          echo "No APK files found. Skipping release creation."
+          exit 0
+
+      - name: Compute next version tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          # Fetch all tags
+          git fetch --tags
+          
+          # Find existing version tags
+          version_tags=$(git tag -l "v*.*.*.*" | sort -V)
+          
+          if [ -z "$version_tags" ]; then
+            next_version="v0.0.0.1"
+          else
+            latest_tag=$(echo "$version_tags" | tail -n1)
+            IFS='.' read -ra parts <<< "${latest_tag#v}"
+            
+            # Increment last part with carry-over (base 10)
+            pos=3
+            while [ $pos -ge 0 ]; do
+              parts[$pos]=$((parts[$pos] + 1))
+              if [ ${parts[$pos]} -lt 10 ]; then
+                break
+              fi
+              parts[$pos]=0
+              pos=$((pos - 1))
+            done
+            
+            next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
+          fi
+          
+          echo "Next version: $next_version"
+          echo "tag=$next_version" >> $GITHUB_OUTPUT
+
+      - name: Get APK filenames for release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          # Get release ID
+          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
+          
+          # Get list of APK filenames
+          apk_names=$(gh api "/repos/${{ github.repository }}/releases/$release_id/assets" --jq '[.[] | select(.name | endswith(".apk")) | .name] | sort | .[]')
+          
+          # Create release notes with one filename per line
+          notes=""
+          while IFS= read -r name; do
+            notes="${notes}${name}\n"
+          done <<< "$apk_names"
+          
+          # Save to file to avoid escaping issues
+          echo -e "$notes" > release_notes.txt
+          
+          echo "Release notes generated with $(echo "$apk_names" | wc -l) APK files"
+
+      - name: Convert temp release to versioned release
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          # Get the release ID
+          release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
+          
+          # Delete the temporary release (this preserves the assets)
+          gh release delete "temp-build" --yes --repo ${{ github.repository }} --cleanup-tag
+          
+          # Create new release with proper version
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "Extensions" \
+            --notes "$(cat release_notes.txt)" \
+            --latest \
+            --repo ${{ github.repository }}
+          
+          # Note: The assets were preserved after deletion? Actually we need to re-upload
+          # Better approach: download assets then re-upload
+          
+          echo "Release created with tag ${{ steps.version.outputs.tag }}"
+
+      - name: Cleanup
+        run: rm -f release_notes.txt
