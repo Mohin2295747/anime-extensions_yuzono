@@ -1,7 +1,10 @@
 package eu.kanade.tachiyomi.animeextension.en.hanime
 
+import android.app.Application
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -11,17 +14,18 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
 import java.util.Locale
@@ -34,60 +38,259 @@ class Hanime :
 
     override val baseUrl = "https://hanime.tv"
 
+    /** CDN base URL for manifest and search API requests. */
+    private val cdnBaseUrl = "https://cached.freeanimehentai.net"
+
     override val lang = "en"
 
     override val supportsLatest = true
 
+    override fun headersBuilder() = Headers.Builder()
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
+        .add("Accept", "application/json")
+        .add("Accept-Language", "en-US,en;q=0.9")
+        .add("Origin", "https://hanime.tv")
+        .add("Referer", "https://hanime.tv/")
+
+    private fun videoHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "https://player.hanime.tv/")
+        .set("Origin", "https://player.hanime.tv")
+        .build()
+
+    /** Headers for video stream requests (m3u8, segments, AES key). */
+    private fun playerVideoHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "https://player.hanime.tv/")
+        .set("Origin", "https://player.hanime.tv")
+        .build()
+
+    @Volatile
     private var authCookie: String? = null
 
     private val json: Json by injectLazy()
 
+    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+
     private val preferences by getPreferencesLazy()
 
-    private fun searchRequestBody(query: String, page: Int, filters: AnimeFilterList): RequestBody {
-        val (includedTags, blackListedTags, brands, tagsMode, orderBy, ordering) = getSearchParameters(filters)
+    private val context: Application by injectLazy()
+    private var signatureProvider: SignatureProvider? = null
+    private val signatureProviderMutex = Mutex()
 
-        return """
-            {"search_text": "$query",
-            "tags": $includedTags,
-            "tags_mode":"$tagsMode",
-            "brands": $brands,
-            "blacklist": $blackListedTags,
-            "order_by": "$orderBy",
-            "ordering": "$ordering",
-            "page": ${page - 1}}
-        """.trimIndent().toRequestBody("application/json".toMediaType())
+    private suspend fun ensureSignatureProvider(): SignatureProvider {
+        signatureProvider?.let { return it }
+
+        return signatureProviderMutex.withLock {
+            // Double-check after acquiring lock
+            signatureProvider?.let { return it }
+
+            val providerMode = preferences.getString(PREF_SIG_PROVIDER_KEY, PREF_SIG_PROVIDER_DEFAULT)!!
+            val provider = when (providerMode) {
+                "webview" -> SignatureCache(WebViewSignatureProvider())
+                "wasm" -> {
+                    val binary = runCatching {
+                        withContext(Dispatchers.IO) { HanimeWasmBinary.fetchWasmBinary(client) }
+                    }.getOrNull()
+                    if (binary != null) {
+                        SignatureCache(ChicorySignatureProvider(binary))
+                    } else {
+                        SignatureCache(WebViewSignatureProvider())
+                    }
+                }
+                else -> SignatureCache(WebViewSignatureProvider())
+            }
+            signatureProvider = provider
+            provider
+        }
     }
 
-    private val popularRequestHeaders =
-        Headers.headersOf("authority", "search.htv-services.com", "accept", "application/json, text/plain, */*", "content-type", "application/json;charset=UTF-8")
+    // ── Search API (v10 GET endpoint) ──────────────────────────────────
 
-    override fun popularAnimeRequest(page: Int): Request = POST("https://search.htv-services.com/", popularRequestHeaders, searchRequestBody("", page, AnimeFilterList()))
+    /** Cached full search response for pagination and client-side filtering. */
+    @Volatile
+    private var cachedSearchHits: List<HitsModel>? = null
 
-    override fun popularAnimeParse(response: Response) = parseSearchJson(response)
+    /**
+     * Fetch or return cached search results from the v10 search API.
+     * The API returns all content in a single response — pagination and
+     * filtering are handled client-side.
+     */
+    private suspend fun fetchSearchHits(): List<HitsModel> {
+        cachedSearchHits?.let { return it }
 
-    private fun parseSearchJson(response: Response): AnimesPage {
-        val jsonLine = response.body.string().ifEmpty { return AnimesPage(emptyList(), false) }
+        val signature = ensureSignatureProvider().getSignature()
+        val searchHeaders = headers.newBuilder().apply {
+            SignatureHeaders.build(signature).forEach { (key, value) ->
+                add(key, value)
+            }
+        }.build()
 
-        val jResponse = jsonLine.parseAs<HAnimeResponse>()
-        val hasNextPage = jResponse.page < jResponse.nbPages - 1
-        val array = jResponse.hits.parseAs<Array<HitsModel>>()
+        val response = client.newCall(GET(SEARCH_API_URL, searchHeaders)).await()
+        val hits = response.use { resp ->
+            val jsonLine = resp.body.string()
+            if (jsonLine.isEmpty()) {
+                emptyList()
+            } else {
+                jsonLine.parseAs<List<HitsModel>>()
+            }
+        }
+        cachedSearchHits = hits
+        return hits
+    }
 
-        val animeList = array.groupBy { getTitle(it.name) }.map { (_, items) -> items.first() }.map { item ->
-            SAnime.create().apply {
-                title = getTitle(item.name)
-                thumbnail_url = item.coverUrl
-                author = item.brand
-                description = item.description?.replace(Regex("<[^>]*>"), "")
-                status = SAnime.UNKNOWN
-                genre = item.tags.joinToString { it }
-                initialized = true
-                setUrlWithoutDomain("https://hanime.tv/videos/hentai/" + item.slug)
+    /**
+     * Build a GET request to the search API with signature authentication headers.
+     * The v10 search endpoint requires x-signature, x-time, and x-signature-version headers.
+     */
+    private suspend fun searchApiRequest(): Request {
+        val signature = ensureSignatureProvider().getSignature()
+        val searchHeaders = headers.newBuilder().apply {
+            SignatureHeaders.build(signature).forEach { (key, value) ->
+                add(key, value)
+            }
+        }.build()
+        return GET(SEARCH_API_URL, searchHeaders)
+    }
+
+    // ── Popular Anime ──────────────────────────────────────────────────
+
+    override fun popularAnimeRequest(page: Int): Request = GET(baseUrl, headers)
+
+    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage {
+        val allHits = fetchSearchHits()
+        return paginateHits(allHits, page, orderBy = "likes", ordering = "desc")
+    }
+
+    // ── Search Anime ───────────────────────────────────────────────────
+
+    private data class SearchParameters(
+        val includedTags: List<String>,
+        val blackListedTags: List<String>,
+        val brands: List<String>,
+        val tagsMode: String,
+        val orderBy: String,
+        val ordering: String,
+    )
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = GET(baseUrl, headers)
+
+    override fun searchAnimeParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val (includedTags, blackListedTags, brands, tagsMode, orderBy, ordering) = getSearchParameters(filters)
+        val allHits = fetchSearchHits()
+        return paginateHits(
+            hits = allHits,
+            page = page,
+            query = query,
+            includedTags = includedTags,
+            blackListedTags = blackListedTags,
+            brands = brands,
+            orderBy = orderBy,
+            ordering = ordering,
+        )
+    }
+
+    // ── Latest Updates ─────────────────────────────────────────────────
+
+    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
+
+    override fun latestUpdatesParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val allHits = fetchSearchHits()
+        return paginateHits(allHits, page, orderBy = "created_at_unix", ordering = "desc")
+    }
+
+    // ── Hit parsing & pagination ───────────────────────────────────────
+
+    private fun parseHitsToAnimeList(hits: List<HitsModel>): List<SAnime> = hits.groupBy { getTitle(it.name) }.map { (_, items) -> items.first() }.map { item ->
+        SAnime.create().apply {
+            title = getTitle(item.name)
+            thumbnail_url = item.coverUrl
+            author = item.brand
+            description = item.description?.replace(Regex("<[^>]*>"), "")
+            status = SAnime.UNKNOWN
+            genre = item.tags.joinToString { it }
+            initialized = true
+            setUrlWithoutDomain("https://hanime.tv/videos/hentai/" + item.slug)
+        }
+    }
+
+    private val pageSize = 24
+
+    /**
+     * Paginate and sort the full hit list for a given page number.
+     * The v10 search API returns all content in one response, so
+     * pagination is handled client-side.
+     */
+    private fun paginateHits(
+        hits: List<HitsModel>,
+        page: Int,
+        query: String = "",
+        includedTags: List<String> = emptyList(),
+        blackListedTags: List<String> = emptyList(),
+        brands: List<String> = emptyList(),
+        orderBy: String = "likes",
+        ordering: String = "desc",
+    ): AnimesPage {
+        var filtered = hits
+
+        // Apply text search filter
+        if (query.isNotEmpty()) {
+            val lowerQuery = query.lowercase(Locale.US)
+            filtered = filtered.filter { hit ->
+                hit.name.lowercase(Locale.US).contains(lowerQuery) ||
+                    hit.tags.any { tag -> tag.lowercase(Locale.US).contains(lowerQuery) } ||
+                    (hit.brand?.lowercase(Locale.US)?.contains(lowerQuery) == true)
             }
         }
 
-        return AnimesPage(animeList, hasNextPage)
+        // Apply tag inclusion filter
+        if (includedTags.isNotEmpty()) {
+            val lowerTags = includedTags.map { it.lowercase(Locale.US) }
+            filtered = filtered.filter { hit ->
+                lowerTags.any { tag -> hit.tags.any { it.lowercase(Locale.US) == tag } }
+            }
+        }
+
+        // Apply tag blacklist filter
+        if (blackListedTags.isNotEmpty()) {
+            val lowerBlacklist = blackListedTags.map { it.lowercase(Locale.US) }
+            filtered = filtered.filterNot { hit ->
+                lowerBlacklist.any { tag -> hit.tags.any { it.lowercase(Locale.US) == tag } }
+            }
+        }
+
+        // Apply brand filter
+        if (brands.isNotEmpty()) {
+            val lowerBrands = brands.map { it.lowercase(Locale.US) }
+            filtered = filtered.filter { hit ->
+                hit.brand?.lowercase(Locale.US) in lowerBrands
+            }
+        }
+
+        // Apply sorting
+        val comparator = when (orderBy) {
+            "views" -> compareByDescending<HitsModel> { it.views ?: 0L }
+            "likes" -> compareByDescending<HitsModel> { it.likes ?: 0L }
+            "created_at_unix", "published_at_unix" -> compareByDescending<HitsModel> { it.createdAtUnix ?: 0L }
+            "released_at_unix" -> compareByDescending<HitsModel> { it.releasedAtUnix ?: 0L }
+            else -> compareByDescending<HitsModel> { it.likes ?: 0L }
+        }
+        val sorted = if (ordering == "asc") filtered.sortedWith(comparator.reversed()) else filtered.sortedWith(comparator)
+
+        // Paginate
+        val fromIndex = (page - 1) * pageSize
+        val toIndex = minOf(fromIndex + pageSize, sorted.size)
+        val pageItems = if (fromIndex < sorted.size) sorted.subList(fromIndex, toIndex) else emptyList()
+        val hasNextPage = toIndex < sorted.size
+
+        return AnimesPage(parseHitsToAnimeList(pageItems), hasNextPage)
     }
+
+    // ── Helpers ────────────────────────────────────────────────────────
 
     private fun isNumber(num: String) = (num.toIntOrNull() != null)
 
@@ -102,16 +305,14 @@ class Hanime :
         }
     }
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = POST("https://search.htv-services.com/", popularRequestHeaders, searchRequestBody(query, page, filters))
-
-    override fun searchAnimeParse(response: Response): AnimesPage = parseSearchJson(response)
+    // ── Anime Details ──────────────────────────────────────────────────
 
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         return SAnime.create().apply {
             title = getTitle(document.select("h1.tv-title").text())
-            thumbnail_url = document.select("img.hvpi-cover").attr("src")
-            author = document.select("a.hvpimbc-text").text()
+            thumbnail_url = document.selectFirst("img.hvpi-cover")?.attr("src")
+            author = document.selectFirst("a.hvpimbc-text")?.text() ?: ""
             description = document.select("div.hvpist-description p").joinToString("\n\n") { it.text() }
             status = SAnime.UNKNOWN
             genre = document.select("div.hvpis-text div.btn__content").joinToString { it.text() }
@@ -120,6 +321,8 @@ class Hanime :
         }
     }
 
+    // ── Video List ─────────────────────────────────────────────────────
+
     override fun videoListRequest(episode: SEpisode) = GET(episode.url)
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
@@ -127,27 +330,186 @@ class Hanime :
         if (authCookie != null) {
             return fetchVideoListPremium(episode)
         }
-        return super.getVideoList(episode)
+        // Try manifest endpoint with WASM signature first
+        return fetchVideoListWithSignature(episode)
     }
 
-    private fun fetchVideoListPremium(episode: SEpisode): List<Video> {
-        val id = episode.url.substringAfter("?id=")
-        val headers = headers.newBuilder().add("cookie", authCookie!!)
-        val document = client.newCall(GET("$baseUrl/videos/hentai/$id", headers = headers.build())).execute().asJsoup()
+    /**
+     * Fetch video list using the manifest endpoint with WASM-generated signature headers.
+     *
+     * Flow:
+     * 1. Call /api/v8/video?id={slug} to get the numeric hvId
+     * 2. Call the guest manifest endpoint with signature headers for real stream URLs
+     * 3. Use PlaylistUtils to parse m3u8 playlists into properly-headed Video objects
+     * 4. Fall back to decoy streams from /api/v8/video if manifest fails
+     */
+    private suspend fun fetchVideoListWithSignature(episode: SEpisode): List<Video> {
+        val slug = episode.url.substringAfter("id=")
 
-        val parsed = document.selectFirst("script:containsData(__NUXT__)")!!.data()
-            .substringAfter("__NUXT__=").substringBeforeLast(";").parseAs<WindowNuxt>()
+        // Step 1: Get the numeric video ID (hvId) from the video endpoint
+        val videoString = client.newCall(GET("$baseUrl/api/v8/video?id=$slug", headers)).await().use { it.body.string() }
+        if (videoString.isEmpty()) return emptyList()
 
-        return parsed.state.data.video.videos_manifest.servers.flatMap { server ->
-            server.streams.map { stream -> Video(stream.url, stream.height + "p", stream.url) }
+        val videoModel = videoString.parseAs<VideoModel>()
+        val hvId = videoModel.hentaiVideo?.id
+            ?: videoModel.videosManifest?.servers?.firstOrNull()?.streams?.firstOrNull()?.hvId
+            ?: return tryParseDecoyStreams(videoString)
+
+        // Step 2: Get real streams from the guest manifest endpoint
+        return try {
+            val manifestStreams = fetchManifestVideos(hvId, retryOnAuthFailure = true)
+            if (manifestStreams.isNotEmpty()) manifestStreams else tryParseDecoyStreams(videoString)
+        } catch (_: Exception) {
+            tryParseDecoyStreams(videoString)
         }
     }
 
-    override fun videoListParse(response: Response): List<Video> {
+    /** Last resort: the /api/v8/video response contains decoy manifest URLs (streamable.cloud) that don't work. Return empty rather than broken streams. */
+    private fun tryParseDecoyStreams(@Suppress("UNUSED_PARAMETER") videoString: String): List<Video> {
+        Log.w("Hanime", "Falling back to decoy streams — these URLs are non-functional, returning empty list")
+        return emptyList()
+    }
+
+    /**
+     * Fetch video streams from the CDN manifest endpoint using signature authentication.
+     * When [retryOnAuthFailure] is true, a 401 response triggers a single retry with a
+     * fresh signature after invalidating the cache.
+     */
+    private suspend fun fetchManifestVideos(hvId: Long, retryOnAuthFailure: Boolean = false): List<Video> {
+        val signature = ensureSignatureProvider().getSignature()
+        val sigHeaders = headers.newBuilder().apply {
+            SignatureHeaders.build(signature).forEach { (key, value) -> add(key, value) }
+        }.build()
+
+        val manifestResponse = client.newCall(
+            GET("$cdnBaseUrl/api/v8/guest/videos/$hvId/manifest", sigHeaders),
+        ).await()
+
+        val result = manifestResponse.use { response ->
+            if (response.isSuccessful) {
+                return@use parseManifestStreams(response)
+            }
+            emptyList()
+        }
+
+        if (result.isNotEmpty()) return result
+
+        // 401 likely means the signature has expired — retry once with a fresh one
+        if (manifestResponse.code == 401 && retryOnAuthFailure) {
+            (signatureProvider as? SignatureCache)?.invalidate()
+            val freshSignature = ensureSignatureProvider().getSignature()
+            val retryHeaders = headers.newBuilder().apply {
+                SignatureHeaders.build(freshSignature).forEach { (key, value) -> add(key, value) }
+            }.build()
+
+            val retryResponse = client.newCall(
+                GET("$cdnBaseUrl/api/v8/guest/videos/$hvId/manifest", retryHeaders),
+            ).await()
+
+            return retryResponse.use { response ->
+                if (response.isSuccessful) {
+                    parseManifestStreams(response)
+                } else {
+                    emptyList()
+                }
+            }
+        }
+
+        return emptyList()
+    }
+
+    /**
+     * Parse the guest manifest response and extract HLS video streams.
+     * Uses PlaylistUtils.extractFromHls() to properly handle multi-quality
+     * m3u8 playlists and set correct headers for segment/AES key requests.
+     */
+    private suspend fun parseManifestStreams(response: Response): List<Video> {
         val responseString = response.body.string().ifEmpty { return emptyList() }
-        return responseString.parseAs<VideoModel>().videosManifest?.servers?.get(0)?.streams?.filter { it.kind != "premium_alert" }?.map {
-            Video(it.url, "${it.height}p", it.url)
+        val manifestData = responseString.parseAs<ManifestWrapper>()
+        val playerHeaders = playerVideoHeaders()
+
+        return manifestData.videosManifest.servers.flatMap { server ->
+            server.streams
+                .filter { it.isGuestAllowed == true && it.url.contains(".m3u8") }
+                .flatMap { stream ->
+                    try {
+                        playlistUtils.extractFromHls(
+                            playlistUrl = stream.url,
+                            masterHeaders = playerHeaders,
+                            videoHeaders = playerHeaders,
+                            videoNameGen = { quality ->
+                                val label = if (quality == "Video") "${stream.height ?: "unknown"}p" else quality
+                                "${server.name} - $label"
+                            },
+                        )
+                    } catch (_: Exception) {
+                        // Fallback: create a single Video from the stream URL
+                        listOf(Video(stream.url, "${server.name} - ${stream.height ?: "unknown"}p", stream.url, headers = playerHeaders))
+                    }
+                }
+        }
+    }
+
+    private suspend fun fetchVideoListPremium(episode: SEpisode): List<Video> {
+        val cookie = authCookie ?: return emptyList()
+        val slug = episode.url.substringAfter("?id=")
+        val headers = headers.newBuilder().add("cookie", cookie)
+        val document = client.newCall(GET("$baseUrl/videos/hentai/$slug", headers = headers.build())).await().asJsoup()
+
+        val nuxtScript = document.selectFirst("script:containsData(__NUXT__)") ?: return emptyList()
+        val nuxtData = nuxtScript.data()
+            .substringAfter("__NUXT__=")
+            .substringBeforeLast(";")
+        val parsed = nuxtData.parseAs<WindowNuxt>()
+
+        // Try CDN guest manifest first — it has real Golem server streams (not Shiva decoys)
+        val hvId = parsed.state.data.video.hentai_video?.id
+        if (hvId != null) {
+            try {
+                val manifestStreams = fetchManifestVideos(hvId, retryOnAuthFailure = true)
+                if (manifestStreams.isNotEmpty()) return manifestStreams
+            } catch (_: Exception) {
+                // Fall through to __NUXT__ streams below
+            }
+        }
+
+        // Fallback: parse __NUXT__ manifest streams (may contain decoy URLs for premium-only content)
+        val playerHeaders = playerVideoHeaders()
+        return parsed.state.data.video.videos_manifest.servers.flatMap { server ->
+            server.streams.filter { it.url.contains(".m3u8") }.flatMap { stream ->
+                try {
+                    playlistUtils.extractFromHls(
+                        playlistUrl = stream.url,
+                        masterHeaders = playerHeaders,
+                        videoHeaders = playerHeaders,
+                        videoNameGen = { quality ->
+                            val label = if (quality == "Video") "${stream.height ?: "unknown"}p" else quality
+                            "${server.name} - $label"
+                        },
+                    )
+                } catch (_: Exception) {
+                    emptyList()
+                }
+            }
+        }
+    }
+
+    override fun videoListParse(response: Response): List<Video> = parseVideoModelStreams(response.body.string())
+
+    private fun parseVideoModelStreams(responseString: String): List<Video> {
+        if (responseString.isEmpty()) return emptyList()
+        val videoModel = responseString.parseAs<VideoModel>()
+        val manifestStreams = videoModel.videosManifest?.servers?.flatMap { server ->
+            server.streams.filter { it.kind != "premium_alert" && it.isGuestAllowed == true }
         } ?: emptyList()
+
+        return if (manifestStreams.isNotEmpty()) {
+            manifestStreams.map { stream ->
+                Video(stream.url, "${stream.height ?: "unknown"}p", stream.url, headers = playerVideoHeaders())
+            }
+        } else {
+            emptyList()
+        }
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -160,9 +522,11 @@ class Hanime :
         ).reversed()
     }
 
+    // ── Episode List ───────────────────────────────────────────────────
+
     override fun episodeListRequest(anime: SAnime): Request {
         val slug = anime.url.substringAfterLast("/")
-        return GET("$baseUrl/api/v8/video?id=$slug")
+        return GET("$baseUrl/api/v8/video?id=$slug", headers)
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
@@ -172,10 +536,12 @@ class Hanime :
                 episode_number = idx + 1f
                 name = "Episode ${idx + 1}"
                 date_upload = (it.releasedAtUnix ?: 0) * 1000
-                url = "$baseUrl/api/v8/video?id=${it.id}"
+                url = "$baseUrl/api/v8/video?id=${it.slug}"
             }
         }?.reversed() ?: emptyList()
     }
+
+    // ── Auth ───────────────────────────────────────────────────────────
 
     private fun setAuthCookie() {
         if (authCookie == null) {
@@ -186,22 +552,8 @@ class Hanime :
         }
     }
 
-    private fun latestSearchRequestBody(page: Int): RequestBody = """
-            {"search_text": "",
-            "tags": [],
-            "tags_mode":"AND",
-            "brands": [],
-            "blacklist": [],
-            "order_by": "published_at_unix",
-            "ordering": "desc",
-            "page": ${page - 1}}
-    """.trimIndent().toRequestBody("application/json".toMediaType())
+    // ── Filters ────────────────────────────────────────────────────────
 
-    override fun latestUpdatesRequest(page: Int) = POST("https://search.htv-services.com/", popularRequestHeaders, latestSearchRequestBody(page))
-
-    override fun latestUpdatesParse(response: Response) = parseSearchJson(response)
-
-    // Filters
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         TagList(getTags()),
         BrandList(getBrands()),
@@ -216,9 +568,9 @@ class Hanime :
     private class TagInclusionMode : AnimeFilter.Select<String>("Included tags mode", arrayOf("And", "Or"), 0)
 
     private fun getSearchParameters(filters: AnimeFilterList): SearchParameters {
-        val includedTags = ArrayList<String>()
-        val blackListedTags = ArrayList<String>()
-        val brands = ArrayList<String>()
+        val includedTags = mutableListOf<String>()
+        val blackListedTags = mutableListOf<String>()
+        val brands = mutableListOf<String>()
         var tagsMode = "AND"
         var orderBy = "likes"
         var ordering = "desc"
@@ -228,15 +580,15 @@ class Hanime :
                     filter.state.forEach { tag ->
                         if (tag.isIncluded()) {
                             includedTags.add(
-                                "\"" + tag.id.lowercase(
+                                tag.id.lowercase(
                                     Locale.US,
-                                ) + "\"",
+                                ),
                             )
                         } else if (tag.isExcluded()) {
                             blackListedTags.add(
-                                "\"" + tag.id.lowercase(
+                                tag.id.lowercase(
                                     Locale.US,
-                                ) + "\"",
+                                ),
                             )
                         }
                     }
@@ -262,9 +614,9 @@ class Hanime :
                     filter.state.forEach { brand ->
                         if (brand.state) {
                             brands.add(
-                                "\"" + brand.id.lowercase(
+                                brand.id.lowercase(
                                     Locale.US,
-                                ) + "\"",
+                                ),
                             )
                         }
                     }
@@ -273,7 +625,7 @@ class Hanime :
                 else -> {}
             }
         }
-        return SearchParameters(includedTags, blackListedTags, brands, tagsMode, orderBy, ordering)
+        return SearchParameters(includedTags.toList(), blackListedTags.toList(), brands.toList(), tagsMode, orderBy, ordering)
     }
 
     private fun getBrands() = listOf(
@@ -510,11 +862,18 @@ class Hanime :
 
     class SortFilter(sortables: Array<String>) : AnimeFilter.Sort("Sort", sortables, Selection(2, false))
 
-    // Preferences
+    // ── Preferences ────────────────────────────────────────────────────
+
     companion object {
+        private const val SEARCH_API_URL = "https://cached.freeanimehentai.net/api/v10/search_hvs"
+
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_DEFAULT = "1080p"
         private val QUALITY_LIST = arrayOf("1080p", "720p", "480p", "360p")
+
+        private const val PREF_SIG_PROVIDER_KEY = "signature_provider"
+        private const val PREF_SIG_PROVIDER_DEFAULT = "wasm"
+        private val SIG_PROVIDER_LIST = arrayOf("wasm", "webview")
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -534,5 +893,22 @@ class Hanime :
             }
         }
         screen.addPreference(videoQualityPref)
+
+        val sigProviderPref = ListPreference(screen.context).apply {
+            key = PREF_SIG_PROVIDER_KEY
+            title = "Signature provider"
+            entries = arrayOf("Chicory WASM Runtime", "WebView (fallback)")
+            entryValues = SIG_PROVIDER_LIST
+            setDefaultValue(PREF_SIG_PROVIDER_DEFAULT)
+            summary = "%s"
+
+            setOnPreferenceChangeListener { _, newValue ->
+                val selected = newValue as String
+                val index = findIndexOfValue(selected)
+                val entry = entryValues[index] as String
+                preferences.edit().putString(key, entry).commit()
+            }
+        }
+        screen.addPreference(sigProviderPref)
     }
 }
