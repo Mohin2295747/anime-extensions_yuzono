@@ -5,10 +5,10 @@ on:
     branches:
       - master
     paths:
-      - '**'
-      - '!**.md'
-      - '!.github/**'
-      - '.github/scripts/**'
+      - ''
+      - '!.md'
+      - '!.github/'
+      - '.github/scripts/'
       - '.github/workflows/build_push.yml'
   workflow_dispatch:
 
@@ -32,51 +32,81 @@ jobs:
     outputs:
       latestCommitMessage: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
       matrix: ${{ steps.generate-matrices.outputs.matrix }}
-
+      delete: ${{ steps.generate-matrices.outputs.delete }}
     steps:
       - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
       - name: Set env
         id: set-env
         run: |
-          echo "LATEST_COMMIT_MESSAGE<<EOF" >> $GITHUB_OUTPUT
-          git log -1 --pretty=%B >> $GITHUB_OUTPUT
-          echo "Built on commit: $(git log -1 --pretty=%H)" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "LATEST_COMMIT_MESSAGE<<{delimiter}
+          $(git log -1 --pretty=%B)
+          Built on commit: $(git log -1 --pretty=%H)
+          {delimiter}" >> $GITHUB_OUTPUT
 
-      - name: Generate full matrix (always build)
-        id: generate-matrices
+      - name: Find lib changes
+        id: modified-libs
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          files: lib/
+          files_ignore: lib/**.md
+          files_separator: " "
+          safe_output: false
+
+      - name: Bump extensions that use a modified lib
+        if: steps.modified-libs.outputs.any_changed == 'true' && github.repository == 'yuzono/anime-extensions'
+        env:
+          COMMIT_MESSAGE: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
         run: |
-          python ./.github/scripts/generate-build-matrices.py "" Release
+          latest_commit_author=$(git log -1 --pretty=%an)
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          chmod +x ./.github/scripts/bump-versions.py
+          ./.github/scripts/bump-versions.py "$COMMIT_MESSAGE" ${{ steps.modified-libs.outputs.all_changed_files }}
+          git push
+
+      - name: Get last successful CI commit
+        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
+        with:
+          main-branch-name: ${{ github.ref_name }}
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
+
+      - id: generate-matrices
+        name: Create output matrices
+        run: |
+          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-
     steps:
       - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: false
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
+        with:
+          cache-read-only: ${{ matrix.chunk.number > 1 }}
 
       - name: Prepare signing key
         run: |
-          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
+          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
           chmod 600 signingkey.jks
 
       - name: Build extensions (${{ matrix.chunk.number }})
@@ -88,48 +118,59 @@ jobs:
         run: |
           ./gradlew $MODULES
 
-      - name: Upload APK artifacts
+      - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: apks-${{ matrix.chunk.number }}
-          path: "**/*.apk"
+          name: apks-chunk-${{ matrix.chunk.number }}
+          path: '**/*.apk'
+          if-no-files-found: ignore
 
       - name: Clean up CI files
-        run: rm -f signingkey.jks
+        run: rm signingkey.jks
 
-  release:
+  create_release:
     name: Create Release
     needs: build
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'yuzono/anime-extensions'
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-
     permissions:
       contents: write
-
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Downloading all APK artifacts
+      - name: Download all APK artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: apks-chunk-*
+          merge-multiple: true
+          path: ./apks
+
+      - name: Create ZIP file with all APKs
+        run: |
+          zip -j all-extensions.zip ./apks/*.apk
+          echo "ZIP file created: all-extensions.zip"
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-extensions-zip
+          path: all-extensions.zip
+          if-no-files-found: error
 
       - name: Compute next version tag
         id: version
         run: |
           git fetch --tags
-
           version_tags=$(git tag -l "v*.*.*.*" | sort -V)
-
           if [ -z "$version_tags" ]; then
             next_version="v0.0.0.1"
           else
             latest_tag=$(echo "$version_tags" | tail -n1)
             IFS='.' read -ra parts <<< "${latest_tag#v}"
-
             pos=3
             while [ $pos -ge 0 ]; do
               parts[$pos]=$((parts[$pos] + 1))
@@ -139,22 +180,30 @@ jobs:
               parts[$pos]=0
               pos=$((pos - 1))
             done
-
             next_version="v${parts[0]}.${parts[1]}.${parts[2]}.${parts[3]}"
           fi
-
+          echo "Next version: $next_version"
           echo "tag=$next_version" >> $GITHUB_OUTPUT
 
       - name: Generate release notes
+        id: notes
         run: |
-          find artifacts -name "*.apk" -type f | sed 's|.*/||' | sort > notes.txt
+          apk_names=$(find ./apks -name "*.apk" -type f -exec basename {} \; | sort)
+          notes=""
+          while IFS= read -r name; do
+            notes="${notes}${name}\n"
+          done <<< "$apk_names"
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo -e "$notes" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-      - name: Create GitHub Release
+      - name: Create versioned release
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           gh release create "${{ steps.version.outputs.tag }}" \
-            artifacts/**/*.apk \
             --title "Extensions" \
-            --notes-file notes.txt \
-            --latest
+            --notes "${{ env.RELEASE_NOTES }}" \
+            --latest \
+            --repo ${{ github.repository }} \
+            ./apks/*.apk
