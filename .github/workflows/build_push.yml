@@ -21,54 +21,19 @@ concurrency:
 
 env:
   CI_CHUNK_SIZE: 15
-  IS_PR_CHECK: false
 
 jobs:
   prepare:
-    permissions:
-      contents: write
     name: Prepare job
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      latestCommitMessage: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
       matrix: ${{ steps.generate-matrices.outputs.matrix }}
-      delete: ${{ steps.generate-matrices.outputs.delete }}
     steps:
       - name: Checkout ${{ github.ref_name }} branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-
-      - name: Set env
-        id: set-env
-        run: |
-          echo "LATEST_COMMIT_MESSAGE<<{delimiter}
-          $(git log -1 --pretty=%B)
-
-          Built on commit: $(git log -1 --pretty=%H)
-          {delimiter}" >> $GITHUB_OUTPUT
-
-      - name: Find lib changes
-        id: modified-libs
-        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
-        with:
-          files: lib/
-          files_ignore: lib/**.md
-          files_separator: " "
-          safe_output: false
-
-      - name: Bump extensions that use a modified lib
-        if: steps.modified-libs.outputs.any_changed == 'true' && github.repository == 'yuzono/anime-extensions'
-        env:
-          COMMIT_MESSAGE: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
-        run: |
-          latest_commit_author=$(git log -1 --pretty=%an)
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          chmod +x ./.github/scripts/bump-versions.py
-          ./.github/scripts/bump-versions.py "$COMMIT_MESSAGE" ${{ steps.modified-libs.outputs.all_changed_files }}
-          git push
 
       - name: Get last successful CI commit
         uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
@@ -153,10 +118,9 @@ jobs:
       - name: Clean up CI files
         run: rm signingkey.jks
 
-  finalize_release:
-    name: Finalize Release
+  release:
+    name: Create Release
     needs: build
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'yuzono/anime-extensions'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -167,7 +131,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wait for all uploads to complete
+      - name: Wait for uploads to complete
         run: sleep 30
 
       - name: Check if temp release exists
@@ -179,38 +143,24 @@ jobs:
             echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
           else
             echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
+            echo "No temporary release found"
+            exit 1
           fi
-
-      - name: Skip if no temp release
-        if: env.RELEASE_EXISTS == 'false'
-        run: |
-          echo "No temporary release found. Skipping release creation."
-          exit 0
 
       - name: Get APK count from temp release
         id: count
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          # Get the release ID for "temp-build"
           release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
-          
-          # Get all assets for the release and count APKs
           apk_count=$(gh api "/repos/${{ github.repository }}/releases/$release_id/assets" --jq '[.[] | select(.name | endswith(".apk"))] | length')
           
           echo "APK_COUNT=$apk_count" >> $GITHUB_ENV
           echo "Found $apk_count APK files in temp release"
 
-      - name: Skip if no APKs found
-        if: env.APK_COUNT == 0
-        run: |
-          echo "No APK files found. Skipping release creation."
-          exit 0
-
       - name: Compute next version tag
         id: version
         run: |
-          # Fetch all tags
           git fetch --tags
           
           # Find existing version tags
@@ -244,7 +194,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          # Get release ID
           release_id=$(gh release view "temp-build" --repo ${{ github.repository }} --json id -q .id)
           
           # Get list of APK filenames
@@ -267,7 +216,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          # Update the release tag, title, and notes (preserves all assets)
           gh release edit "temp-build" \
             --tag "${{ steps.version.outputs.tag }}" \
             --title "Extensions" \
